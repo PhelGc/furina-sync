@@ -1,0 +1,52 @@
+# Binarios compilados de Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Archivos de test
+*.test
+
+# Archivos de cobertura de test
+*.out
+
+# Directorio de dependencias de Go
+vendor/
+
+# Archivos de configuración con credenciales
+config/
+.env
+*.env
+secrets/
+*.key
+*.pem
+
+# Logs
+*.log
+logs/
+
+# Archivos de SO
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build outputs
+build/
+dist/
+bin/
+
+# Temporary files
+tmp/
+temp/
