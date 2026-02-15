@@ -15,12 +15,16 @@
 vendor/
 
 # Archivos de configuración con credenciales
-config/
 .env
 *.env
 secrets/
 *.key
 *.pem
+
+# Archivos de datos
+data/
+*.json
+incidents/
 
 # Logs
 *.log
