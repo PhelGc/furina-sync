@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/PhelGc/furina-sync/internal/config"
 	"github.com/PhelGc/furina-sync/internal/database"
 	"github.com/PhelGc/furina-sync/internal/discord"
+	"github.com/PhelGc/furina-sync/internal/evaluator"
 	"github.com/PhelGc/furina-sync/internal/jira"
 	"github.com/PhelGc/furina-sync/internal/storage"
 )
@@ -26,8 +28,8 @@ func init() {
 	setConsoleMode.Call(uintptr(handle), uintptr(mode|0x0004))
 }
 
-// numWorkers limita la concurrencia para respetar el rate limit de Discord.
-const numWorkers = 5
+// numWorkers limita la concurrencia para respetar el rate limit de Discord y Gemini
+const numWorkers = 3
 
 // Colores ANSI para logs en consola
 const (
@@ -41,72 +43,87 @@ const (
 func main() {
 	log.Println("Furina Sync iniciando...")
 
-	// Cargar configuración
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("Error cargando configuración: %v", err)
 	}
 
-	// Inicializar almacenamiento
+	// Validar configuración del evaluador
+	if !cfg.Eval.Enabled {
+		log.Fatalf("EVAL_ENABLED debe estar en true. El evaluador IA es requerido.")
+	}
+	if cfg.Eval.APIKey == "" {
+		log.Fatalf("GEMINI_API_KEY no está configurado en el .env")
+	}
+
+	// Cargar prompts desde archivos externos (falla explícitamente si no existen)
+	prompts, err := evaluator.LoadPrompts(cfg.Eval.PromptPhase1, cfg.Eval.PromptPhase2)
+	if err != nil {
+		log.Fatalf("Error cargando prompts: %v", err)
+	}
+	log.Printf("Prompts cargados: %s, %s", cfg.Eval.PromptPhase1, cfg.Eval.PromptPhase2)
+
+	evalClient := evaluator.NewClient(cfg.Eval.APIKey, cfg.Eval.Model, prompts)
+
 	store, err := storage.New(cfg.Storage.BasePath)
 	if err != nil {
 		log.Fatalf("Error inicializando storage: %v", err)
 	}
 
-	// Crear cliente Jira
 	jiraClient, err := jira.NewClient(cfg.Jira)
 	if err != nil {
 		log.Fatalf("Error creando cliente Jira: %v", err)
 	}
 
-	// Inicializar cliente Discord
-	discordConfig := &discord.Config{
+	discordClient, err := discord.NewClient(&discord.Config{
 		BotToken:    cfg.Discord.BotToken,
 		GuildID:     cfg.Discord.GuildID,
 		Channels:    cfg.Discord.Channels,
 		JiraBaseURL: cfg.Jira.URL,
-	}
-	discordClient, err := discord.NewClient(discordConfig)
+	})
 	if err != nil {
 		log.Fatalf("Error creando cliente Discord: %v", err)
 	}
+	defer discordClient.Close()
 
-	// Inicializar cliente Database
-	dbConfig := &database.Config{
+	dbClient, err := database.NewClient(&database.Config{
 		Host:     cfg.Database.Host,
 		Port:     cfg.Database.Port,
 		Username: cfg.Database.Username,
 		Password: cfg.Database.Password,
 		Database: cfg.Database.Database,
-	}
-	dbClient, err := database.NewClient(dbConfig)
+	})
 	if err != nil {
 		log.Fatalf("Error conectando a la base de datos: %v", err)
 	}
 	defer dbClient.Close()
 
-	// Crear tabla si no existe
 	if err := dbClient.CreateTable(); err != nil {
-		log.Fatalf("Error creando tabla: %v", err)
+		log.Fatalf("Error creando tabla discord_messages: %v", err)
+	}
+	if err := dbClient.CreateEvaluationTable(); err != nil {
+		log.Fatalf("Error creando tabla incident_evaluations: %v", err)
 	}
 
-	// Crear ticker para ejecutar cada X minutos
 	ticker := time.NewTicker(time.Duration(cfg.Sync.IntervalMinutes) * time.Minute)
 	defer ticker.Stop()
 
-	log.Printf("Sincronización configurada cada %d minutos", cfg.Sync.IntervalMinutes)
-	log.Printf("Re-notificaciones configuradas cada %d minutos", cfg.Discord.RenotifyIntervalMinutes)
+	log.Printf("Sincronización cada %d minutos · Modelo: %s", cfg.Sync.IntervalMinutes, cfg.Eval.Model)
 
-	// Ejecutar sincronización inicial
-	syncIncidents(jiraClient, store, discordClient, dbClient, cfg.Discord.RenotifyIntervalMinutes)
+	syncIncidents(jiraClient, store, discordClient, dbClient, evalClient)
 
-	// Loop principal
 	for range ticker.C {
-		syncIncidents(jiraClient, store, discordClient, dbClient, cfg.Discord.RenotifyIntervalMinutes)
+		syncIncidents(jiraClient, store, discordClient, dbClient, evalClient)
 	}
 }
 
-func syncIncidents(jiraClient *jira.Client, store *storage.Storage, discordClient *discord.Client, dbClient *database.Client, renotifyIntervalMinutes int) {
+func syncIncidents(
+	jiraClient *jira.Client,
+	store *storage.Storage,
+	discordClient *discord.Client,
+	dbClient *database.Client,
+	evalClient *evaluator.Client,
+) {
 	log.Println("Sincronizando incidencias de Jira...")
 
 	incidents, err := jiraClient.GetIncidents()
@@ -115,28 +132,27 @@ func syncIncidents(jiraClient *jira.Client, store *storage.Storage, discordClien
 		return
 	}
 
-	newCount := 0
-	renotifiedCount := 0
-	skippedCount := 0
-	errorCount := 0
-
-	// Crear lista de las claves de incidencias actuales en Jira
-	var currentIncidentKeys []string
-	for _, incident := range incidents {
-		currentIncidentKeys = append(currentIncidentKeys, incident.Key)
+	var currentKeys []string
+	for _, inc := range incidents {
+		currentKeys = append(currentKeys, inc.Key)
 	}
 
-	// Cargar TODOS los mensajes en una sola query (evita N+1)
-	messageCache, err := dbClient.GetMessagesByKeys(currentIncidentKeys)
+	// Carga batch de ambos caches — una sola query cada uno
+	messageCache, err := dbClient.GetMessagesByKeys(currentKeys)
 	if err != nil {
 		log.Printf(clrYellow+"Advertencia: error cargando caché de mensajes: %v"+clrReset, err)
 		messageCache = make(map[string]*database.MessageToDelete)
 	}
 
-	// Procesar incidencias en paralelo con worker pool
+	evalCache, err := dbClient.GetEvaluationsByKeys(currentKeys)
+	if err != nil {
+		log.Printf(clrYellow+"Advertencia: error cargando caché de evaluaciones: %v"+clrReset, err)
+		evalCache = make(map[string]*database.CachedEvaluation)
+	}
+
 	type result struct {
 		isNew    bool
-		notified bool
+		evaluated bool
 		skipped  bool
 		hasError bool
 	}
@@ -150,41 +166,88 @@ func syncIncidents(jiraClient *jira.Client, store *storage.Storage, discordClien
 		go func() {
 			defer wg.Done()
 			for incident := range jobs {
-				existingMsg := messageCache[incident.Key+":"+incident.Assignee]
 				r := result{}
 
+				cachedEval := evalCache[incident.Key]
+				existingMsg := messageCache[incident.Key+":"+incident.Assignee]
+
+				// Comparar con segundo de precisión (MySQL DATETIME no guarda milisegundos)
+				needsEval := cachedEval == nil ||
+					cachedEval.JiraUpdatedAt.Unix() != incident.UpdatedDate.Unix()
+
+				if !needsEval {
+					r.skipped = true
+					results <- r
+					continue
+				}
+
+				// Detectar si es nueva (primera vez que la vemos)
 				r.isNew = !store.IncidentExists(incident.Key, incident.Assignee)
 				if r.isNew {
 					if err := store.SaveIncident(incident); err != nil {
 						log.Printf(clrRed+"Error guardando incidencia %s: %v"+clrReset, incident.Key, err)
-						r.hasError = true
-						results <- r
-						continue
 					}
 					log.Printf(clrGreen+"Nueva incidencia: %s (Assignee: %s)"+clrReset, incident.Key, incident.Assignee)
-				}
-
-				if database.ShouldRenotifyFromCache(existingMsg, renotifyIntervalMinutes) {
-					if err := sendDiscordNotification(incident, discordClient, dbClient, existingMsg); err != nil {
-						log.Printf(clrRed+"Error notificando %s: %v"+clrReset, incident.Key, err)
-						r.hasError = true
-					} else {
-						r.notified = true
-						if !r.isNew {
-							log.Printf(clrCyan+"Re-notificado: %s (Assignee: %s)"+clrReset, incident.Key, incident.Assignee)
-						}
-					}
 				} else {
-					r.skipped = true
+					log.Printf(clrCyan+"Incidencia actualizada: %s (Assignee: %s)"+clrReset, incident.Key, incident.Assignee)
 				}
 
+				// Evaluar con IA
+				eval, err := evalClient.Evaluate(incident)
+				if err != nil {
+					log.Printf(clrRed+"[EVAL] Error evaluando %s: %v"+clrReset, incident.Key, err)
+					r.hasError = true
+					results <- r
+					continue
+				}
+
+				// Borrar mensaje anterior de Discord si existe
+				if existingMsg != nil {
+					if err := discordClient.DeleteMessage(existingMsg.ChannelID, existingMsg.MessageID); err != nil {
+						log.Printf(clrYellow+"Advertencia: no se pudo borrar mensaje anterior %s: %v"+clrReset, existingMsg.MessageID, err)
+					}
+				}
+
+				// Enviar evaluación a Discord
+				discordInc := convertToDiscordIncident(incident)
+				messageID, err := discordClient.SendEvaluationResult(discordInc, eval)
+				if err != nil {
+					log.Printf(clrRed+"Error enviando evaluación %s: %v"+clrReset, incident.Key, err)
+					r.hasError = true
+					results <- r
+					continue
+				}
+
+				// Guardar mensaje en BD
+				channelID, _ := discordClient.GetChannelForAssignee(incident.Assignee)
+				if err := dbClient.UpsertMessage(incident.Key, channelID, messageID, incident.Assignee); err != nil {
+					log.Printf(clrYellow+"Advertencia: error guardando mensaje BD para %s: %v"+clrReset, incident.Key, err)
+				}
+
+				// Guardar evaluación en caché BD
+				p1JSON, _ := json.Marshal(eval.Phase1)
+				var p2 interface{}
+				if eval.Phase2 != nil {
+					p2b, _ := json.Marshal(eval.Phase2)
+					p2 = string(p2b)
+				}
+				if err := dbClient.UpsertEvaluation(incident.Key, incident.UpdatedDate, string(p1JSON), p2); err != nil {
+					log.Printf(clrYellow+"Advertencia: error guardando evaluación para %s: %v"+clrReset, incident.Key, err)
+				}
+
+				scoreLog := fmt.Sprintf("D:%d/100", eval.Phase1.Puntaje)
+				if eval.Phase2 != nil {
+					scoreLog += fmt.Sprintf(" C:%d/100", eval.Phase2.Puntaje)
+				}
+				log.Printf(clrGreen+"Evaluación enviada: %s [%s]"+clrReset, incident.Key, scoreLog)
+				r.evaluated = true
 				results <- r
 			}
 		}()
 	}
 
-	for _, incident := range incidents {
-		jobs <- incident
+	for _, inc := range incidents {
+		jobs <- inc
 	}
 	close(jobs)
 
@@ -193,12 +256,13 @@ func syncIncidents(jiraClient *jira.Client, store *storage.Storage, discordClien
 		close(results)
 	}()
 
+	newCount, evaluatedCount, skippedCount, errorCount := 0, 0, 0, 0
 	for r := range results {
 		if r.isNew {
 			newCount++
 		}
-		if r.notified && !r.isNew {
-			renotifiedCount++
+		if r.evaluated {
+			evaluatedCount++
 		}
 		if r.skipped {
 			skippedCount++
@@ -209,60 +273,29 @@ func syncIncidents(jiraClient *jira.Client, store *storage.Storage, discordClien
 	}
 
 	// Limpiar mensajes de incidencias que ya no están en Jira
-	if err := dbClient.CleanupRemovedIncidents(currentIncidentKeys, discordClient); err != nil {
+	if err := dbClient.CleanupRemovedIncidents(currentKeys, discordClient); err != nil {
 		log.Printf(clrRed+"Error en limpieza: %v"+clrReset, err)
 		errorCount++
 	}
 
 	if errorCount > 0 {
-		log.Printf(clrRed+"Sync completada con %d error(es). Nuevas: %d | Re-notificadas: %d | Omitidas: %d"+clrReset,
-			errorCount, newCount, renotifiedCount, skippedCount)
+		log.Printf(clrRed+"Sync con %d error(es). Nuevas: %d | Evaluadas: %d | Omitidas: %d"+clrReset,
+			errorCount, newCount, evaluatedCount, skippedCount)
 	} else {
-		log.Printf(clrGreen+"Sync OK — Nuevas: %d | Re-notificadas: %d | Omitidas: %d"+clrReset,
-			newCount, renotifiedCount, skippedCount)
+		log.Printf(clrGreen+"Sync OK — Nuevas: %d | Evaluadas: %d | Omitidas: %d"+clrReset,
+			newCount, evaluatedCount, skippedCount)
 	}
-}
-
-// sendDiscordNotification realiza el flujo completo de notificación Discord.
-// Recibe existingMsg pre-cargado desde el caché para evitar queries adicionales a la DB.
-func sendDiscordNotification(incident *jira.Incident, discordClient *discord.Client, dbClient *database.Client, existingMsg *database.MessageToDelete) error {
-	// Si existe mensaje anterior, borrarlo de Discord antes de enviar el nuevo
-	if existingMsg != nil {
-		if err := discordClient.DeleteMessage(existingMsg.ChannelID, existingMsg.MessageID); err != nil {
-			log.Printf(clrYellow+"Advertencia: no se pudo borrar mensaje anterior %s: %v"+clrReset, existingMsg.MessageID, err)
-		}
-	}
-
-	// Enviar nuevo mensaje
-	discordIncident := convertToDiscordIncident(incident)
-	messageID, err := discordClient.SendIncidentNotification(discordIncident)
-	if err != nil {
-		return fmt.Errorf("error enviando notificación: %v", err)
-	}
-
-	// Guardar/actualizar el nuevo mensaje en BD con timestamp actual
-	channelID, exists := discordClient.GetChannelForAssignee(incident.Assignee)
-	if !exists {
-		return fmt.Errorf("no se encontró canal para assignee: %s", incident.Assignee)
-	}
-
-	if err := dbClient.UpsertMessage(incident.Key, channelID, messageID, incident.Assignee); err != nil {
-		log.Printf(clrYellow+"Advertencia: error guardando mensaje en BD para %s: %v"+clrReset, incident.Key, err)
-	}
-
-	log.Printf(clrGreen+"Notificado: %s (Assignee: %s)"+clrReset, incident.Key, incident.Assignee)
-	return nil
 }
 
 // convertToDiscordIncident convierte una incidencia de Jira al formato Discord
-func convertToDiscordIncident(jiraIncident *jira.Incident) *discord.Incident {
+func convertToDiscordIncident(inc *jira.Incident) *discord.Incident {
 	return &discord.Incident{
-		Key:         jiraIncident.Key,
-		Title:       jiraIncident.Title,
-		Status:      jiraIncident.Status,
-		IssueType:   jiraIncident.IssueType,
-		Assignee:    jiraIncident.Assignee,
-		CreatedDate: jiraIncident.CreatedDate.Format("2006-01-02T15:04:05Z07:00"),
-		UpdatedDate: jiraIncident.UpdatedDate.Format("2006-01-02T15:04:05Z07:00"),
+		Key:         inc.Key,
+		Title:       inc.Title,
+		Status:      inc.Status,
+		IssueType:   inc.IssueType,
+		Assignee:    inc.Assignee,
+		CreatedDate: inc.CreatedDate.Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedDate: inc.UpdatedDate.Format("2006-01-02T15:04:05Z07:00"),
 	}
 }

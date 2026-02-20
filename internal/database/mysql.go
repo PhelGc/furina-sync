@@ -22,6 +22,12 @@ type Config struct {
 	Database string
 }
 
+// CachedEvaluation representa una evaluación IA guardada en BD
+type CachedEvaluation struct {
+	IncidentKey   string
+	JiraUpdatedAt time.Time
+}
+
 type MessageToDelete struct {
 	ID               int       `json:"id"`
 	IncidentKey      string    `json:"incident_key"`
@@ -77,6 +83,85 @@ func (c *Client) CreateTable() error {
 	}
 
 	log.Println("Tabla discord_messages verificada/creada exitosamente")
+	return nil
+}
+
+// CreateEvaluationTable crea la tabla incident_evaluations si no existe
+func (c *Client) CreateEvaluationTable() error {
+	query := `
+	CREATE TABLE IF NOT EXISTS incident_evaluations (
+		incident_key    VARCHAR(50)  NOT NULL,
+		jira_updated_at DATETIME     NOT NULL,
+		phase1_result   JSON         NOT NULL,
+		phase2_result   JSON,
+		evaluated_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (incident_key),
+		INDEX idx_updated (jira_updated_at)
+	);`
+
+	_, err := c.db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("error creando tabla incident_evaluations: %v", err)
+	}
+
+	log.Println("Tabla incident_evaluations verificada/creada exitosamente")
+	return nil
+}
+
+// GetEvaluationsByKeys carga el cache de evaluaciones para un conjunto de incidencias en una sola query.
+// Retorna un mapa incident_key → CachedEvaluation para comparar jira_updated_at.
+func (c *Client) GetEvaluationsByKeys(keys []string) (map[string]*CachedEvaluation, error) {
+	result := make(map[string]*CachedEvaluation)
+	if len(keys) == 0 {
+		return result, nil
+	}
+
+	placeholders := strings.Repeat("?,", len(keys))
+	placeholders = placeholders[:len(placeholders)-1]
+
+	query := fmt.Sprintf(
+		`SELECT incident_key, jira_updated_at FROM incident_evaluations WHERE incident_key IN (%s)`,
+		placeholders)
+
+	args := make([]interface{}, len(keys))
+	for i, k := range keys {
+		args[i] = k
+	}
+
+	rows, err := c.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("error cargando evaluaciones por keys: %v", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var e CachedEvaluation
+		if err := rows.Scan(&e.IncidentKey, &e.JiraUpdatedAt); err != nil {
+			log.Printf("Error escaneando evaluación: %v", err)
+			continue
+		}
+		result[e.IncidentKey] = &e
+	}
+
+	return result, nil
+}
+
+// UpsertEvaluation inserta o actualiza el resultado de una evaluación IA.
+// phase2JSON puede ser nil si la incidencia no tiene conclusión.
+func (c *Client) UpsertEvaluation(incidentKey string, jiraUpdatedAt time.Time, phase1JSON string, phase2JSON interface{}) error {
+	query := `
+	INSERT INTO incident_evaluations (incident_key, jira_updated_at, phase1_result, phase2_result, evaluated_at)
+	VALUES (?, ?, ?, ?, NOW())
+	ON DUPLICATE KEY UPDATE
+		jira_updated_at = VALUES(jira_updated_at),
+		phase1_result   = VALUES(phase1_result),
+		phase2_result   = VALUES(phase2_result),
+		evaluated_at    = NOW()`
+
+	_, err := c.db.Exec(query, incidentKey, jiraUpdatedAt, phase1JSON, phase2JSON)
+	if err != nil {
+		return fmt.Errorf("error guardando evaluación para %s: %v", incidentKey, err)
+	}
 	return nil
 }
 

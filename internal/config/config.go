@@ -15,6 +15,16 @@ type Config struct {
 	Storage  StorageConfig
 	Discord  DiscordConfig
 	Database DatabaseConfig
+	Eval     EvalConfig
+}
+
+// EvalConfig configuración del evaluador IA (Gemini)
+type EvalConfig struct {
+	Enabled      bool
+	APIKey       string
+	Model        string
+	PromptPhase1 string // ruta al archivo de prompt fase 1
+	PromptPhase2 string // ruta al archivo de prompt fase 2
 }
 
 // JiraConfig configuración de conexión a Jira
@@ -99,6 +109,13 @@ func Load() (*Config, error) {
 			Username: os.Getenv("DB_USERNAME"),
 			Password: os.Getenv("DB_PASSWORD"),
 			Database: getEnvOrDefault("DB_DATABASE", "furina_sync"),
+		},
+		Eval: EvalConfig{
+			Enabled:      os.Getenv("EVAL_ENABLED") == "true",
+			APIKey:       os.Getenv("GEMINI_API_KEY"),
+			Model:        getEnvOrDefault("EVAL_MODEL", "gemini-2.0-flash"),
+			PromptPhase1: getEnvOrDefault("EVAL_PROMPT_PHASE1", "prompts/phase1.txt"),
+			PromptPhase2: getEnvOrDefault("EVAL_PROMPT_PHASE2", "prompts/phase2.txt"),
 		},
 	}
 
