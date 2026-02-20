@@ -2,7 +2,6 @@ package discord
 
 import (
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -14,16 +13,15 @@ type Client struct {
 }
 
 type Config struct {
-	BotToken string
-	GuildID  string
-	Channels map[string]string // Map de assignee -> channel ID
+	BotToken    string
+	GuildID     string
+	Channels    map[string]string // Map de assignee -> channel ID
+	JiraBaseURL string            // URL base de Jira para construir links a incidencias
 }
 
 type Incident struct {
 	Key         string
 	Title       string
-	Description string
-	Conclusion  string
 	Status      string
 	IssueType   string
 	Assignee    string
@@ -57,9 +55,6 @@ func (c *Client) SendIncidentNotification(incident *Incident) (string, error) {
 		return "", fmt.Errorf("error enviando mensaje a Discord: %v", err)
 	}
 
-	log.Printf("Notificación enviada a Discord - Canal: %s, Mensaje ID: %s, Incidencia: %s",
-		channelID, message.ID, incident.Key)
-
 	return message.ID, nil
 }
 
@@ -76,7 +71,6 @@ func (c *Client) DeleteMessage(channelID, messageID string) error {
 		return fmt.Errorf("error borrando mensaje de Discord: %v", err)
 	}
 
-	log.Printf("Mensaje borrado de Discord - Canal: %s, Mensaje ID: %s", channelID, messageID)
 	return nil
 }
 
@@ -95,20 +89,9 @@ func (c *Client) buildIncidentEmbed(incident *Incident) *discordgo.MessageEmbed 
 		color = 0x9B59B6 // Morado
 	}
 
-	// Truncar descripción si es muy larga
-	description := incident.Description
-	if len(description) > 500 {
-		description = description[:497] + "..."
-	}
-
-	// Truncar conclusión si es muy larga
-	conclusion := incident.Conclusion
-	if len(conclusion) > 500 {
-		conclusion = conclusion[:497] + "..."
-	}
-
 	embed := &discordgo.MessageEmbed{
 		Title: fmt.Sprintf("%s - %s", incident.Key, incident.Title),
+		URL:   c.config.JiraBaseURL + "/browse/" + incident.Key,
 		Color: color,
 		Fields: []*discordgo.MessageEmbedField{
 			{
@@ -131,24 +114,6 @@ func (c *Client) buildIncidentEmbed(incident *Incident) *discordgo.MessageEmbed 
 		Footer: &discordgo.MessageEmbedFooter{
 			Text: "Furina Sync - Notificación automatizada",
 		},
-	}
-
-	// Añadir descripción si existe
-	if description != "" {
-		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
-			Name:   "Descripción",
-			Value:  description,
-			Inline: false,
-		})
-	}
-
-	// Añadir conclusión si existe
-	if conclusion != "" {
-		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
-			Name:   "Conclusión",
-			Value:  conclusion,
-			Inline: false,
-		})
 	}
 
 	return embed

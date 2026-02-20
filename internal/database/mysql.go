@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -32,13 +33,18 @@ type MessageToDelete struct {
 }
 
 func NewClient(config *Config) (*Client, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&loc=Local",
 		config.Username, config.Password, config.Host, config.Port, config.Database)
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("error conectando a MySQL: %v", err)
 	}
+
+	// Pool de conexiones: ajustado al número de workers concurrentes
+	db.SetMaxOpenConns(10)             // máximo de conexiones abiertas simultáneas
+	db.SetMaxIdleConns(5)              // conexiones en espera reutilizables
+	db.SetConnMaxLifetime(5 * time.Minute) // reciclar conexiones antiguas
 
 	if err = db.Ping(); err != nil {
 		return nil, fmt.Errorf("error haciendo ping a MySQL: %v", err)
@@ -107,9 +113,6 @@ func (c *Client) UpsertMessage(incidentKey, channelID, messageID, assignee strin
 		return fmt.Errorf("error insertando/actualizando mensaje: %v", err)
 	}
 
-	log.Printf("Mensaje guardado - Incidencia: %s, Assignee: %s, Canal: %s, Mensaje: %s",
-		incidentKey, assignee, channelID, messageID)
-
 	return nil
 }
 
@@ -153,6 +156,54 @@ func (c *Client) GetAllActiveMessages() ([]MessageToDelete, error) {
 	}
 
 	return messages, nil
+}
+
+// GetMessagesByKeys carga todos los mensajes de un conjunto de incidencias en una sola query.
+// Retorna un mapa con clave "incidentKey:assignee" para acceso O(1).
+func (c *Client) GetMessagesByKeys(keys []string) (map[string]*MessageToDelete, error) {
+	result := make(map[string]*MessageToDelete)
+	if len(keys) == 0 {
+		return result, nil
+	}
+
+	placeholders := strings.Repeat("?,", len(keys))
+	placeholders = placeholders[:len(placeholders)-1] // quitar última coma
+
+	query := fmt.Sprintf(
+		`SELECT id, incident_key, channel_id, message_id, assignee, created_at, last_notification
+		 FROM discord_messages WHERE incident_key IN (%s)`, placeholders)
+
+	args := make([]interface{}, len(keys))
+	for i, k := range keys {
+		args[i] = k
+	}
+
+	rows, err := c.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("error cargando mensajes por keys: %v", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var msg MessageToDelete
+		if err := rows.Scan(&msg.ID, &msg.IncidentKey, &msg.ChannelID, &msg.MessageID,
+			&msg.Assignee, &msg.CreatedAt, &msg.LastNotification); err != nil {
+			log.Printf("Error escaneando mensaje: %v", err)
+			continue
+		}
+		result[msg.IncidentKey+":"+msg.Assignee] = &msg
+	}
+
+	return result, nil
+}
+
+// ShouldRenotifyFromCache evalúa si una incidencia necesita re-notificación usando
+// un mensaje pre-cargado en memoria (sin consultar la base de datos).
+func ShouldRenotifyFromCache(msg *MessageToDelete, intervalMinutes int) bool {
+	if msg == nil {
+		return true // No existe mensaje previo → notificar
+	}
+	return time.Since(msg.LastNotification) >= time.Duration(intervalMinutes)*time.Minute
 }
 
 // ShouldRenotify verifica si una incidencia necesita re-notificación

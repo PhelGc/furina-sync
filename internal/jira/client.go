@@ -52,16 +52,17 @@ type JiraIssue struct {
 
 // JiraFields campos del issue
 type JiraFields struct {
-	Summary     string          `json:"summary"`
-	Description interface{}     `json:"description"`
-	Status      JiraStatus      `json:"status"`
-	IssueType   JiraIssueType   `json:"issuetype"`
-	Assignee    *JiraUser       `json:"assignee"`
-	Resolution  *JiraResolution `json:"resolution"`
-	Created     string          `json:"created"`
-	Updated     string          `json:"updated"`
-	// Campos adicionales que pueden contener información custom
-	CustomFields map[string]interface{} `json:"-"` // Para campos custom
+	Summary          string          `json:"summary"`
+	Description      interface{}     `json:"description"`
+	Status           JiraStatus      `json:"status"`
+	IssueType        JiraIssueType   `json:"issuetype"`
+	Assignee         *JiraUser       `json:"assignee"`
+	Resolution       *JiraResolution `json:"resolution"`
+	Created          string          `json:"created"`
+	Updated          string          `json:"updated"`
+	CustomField10208 json.RawMessage `json:"customfield_10208"`
+	CustomField10207 json.RawMessage `json:"customfield_10207"`
+	CustomField10206 json.RawMessage `json:"customfield_10206"`
 }
 
 // JiraIssueType representa el tipo de issue
@@ -143,28 +144,21 @@ func extractTextFromADFMap(contentMap map[string]interface{}) string {
 	return strings.TrimSpace(result.String())
 }
 
-// extractCustomFieldsFromRaw busca información en campos custom usando JSON raw
-func extractCustomFieldsFromRaw(rawIssue map[string]interface{}, issueKey string) (description string, conclusion string) {
-	if rawIssue == nil {
-		return "", ""
-	}
-
-	// Acceder a los fields del JSON raw
-	if fields, ok := rawIssue["fields"].(map[string]interface{}); ok {
-		// Buscar en múltiples campos custom que pueden contener conclusiones según el tipo de incidencia
-		customFields := []string{"customfield_10208", "customfield_10207", "customfield_10206"}
-		for _, fieldName := range customFields {
-			if customField, exists := fields[fieldName]; exists && customField != nil {
-				conclusionText := extractTextFromADF(customField)
-				if len(conclusionText) > 0 {
-					conclusion = conclusionText
-					break // Usar el primer campo que tenga contenido
-				}
+// extractConclusionFromFields busca la conclusión en los campos custom ya parseados.
+// Evita un segundo json.Unmarshal del body completo.
+func extractConclusionFromFields(fields JiraFields) string {
+	for _, raw := range []json.RawMessage{fields.CustomField10208, fields.CustomField10207, fields.CustomField10206} {
+		if len(raw) == 0 || string(raw) == "null" {
+			continue
+		}
+		var content interface{}
+		if err := json.Unmarshal(raw, &content); err == nil {
+			if text := extractTextFromADF(content); text != "" {
+				return text
 			}
 		}
 	}
-
-	return description, conclusion
+	return ""
 }
 
 // GetIncidents obtiene las incidencias según los filtros configurados usando API v3
@@ -238,41 +232,21 @@ func (c *Client) GetIncidents() ([]*Incident, error) {
 		return nil, fmt.Errorf("error leyendo response: %v", err)
 	}
 
+	// Parse único — los campos custom quedan en json.RawMessage dentro de JiraFields
 	var searchResponse JiraSearchResponse
 	if err := json.Unmarshal(body, &searchResponse); err != nil {
 		return nil, fmt.Errorf("error parseando response: %v", err)
 	}
 
-	// Convertir a nuestro formato
 	var incidents []*Incident
 	now := time.Now()
 
-	// Trabajar directamente con el JSON raw para capturar campos custom
-	var rawResponse map[string]interface{}
-	json.Unmarshal(body, &rawResponse)
-	rawIssues, _ := rawResponse["issues"].([]interface{})
-
-	for i, issue := range searchResponse.Issues {
-		// Obtener el issue raw correspondiente para campos custom
-		var rawIssue map[string]interface{}
-		if i < len(rawIssues) {
-			rawIssue, _ = rawIssues[i].(map[string]interface{})
-		}
-
-		// Extraer descripción básica
+	for _, issue := range searchResponse.Issues {
 		description := extractTextFromADF(issue.Fields.Description)
 
-		// Buscar información adicional en campos custom del JSON raw
-		customDescription, customConclusion := extractCustomFieldsFromRaw(rawIssue, issue.Key)
-		if len(customDescription) > len(description) {
-			description = customDescription
-		}
-
-		// Extraer conclusión - priorizar custom field sobre resolution básica
-		conclusion := ""
-		if len(customConclusion) > 0 {
-			conclusion = customConclusion
-		} else if issue.Fields.Resolution != nil {
+		// Conclusión desde custom fields (ya parseados en la struct)
+		conclusion := extractConclusionFromFields(issue.Fields)
+		if conclusion == "" && issue.Fields.Resolution != nil {
 			conclusion = issue.Fields.Resolution.Description
 		}
 
